@@ -1,11 +1,19 @@
 [DEFAULT]
-all_folders = True
-max_size = 5000
-standard_folder = INBOX
-test_mode = True
+# possible values: [test]|export|delete|detach
+mode = test
 
-[mailserver]
-ServerAliveInterval = 45
+[EXPORT]
+export_folder = export
+
+[MAIL]
+# leave empty for all folders
+mail_folder =
+email_age_days = 365
+ignore_flagged = true
+max_attachment_size = 256kb
+max_mail_size = 4MB
+
+[MAILSERVER]
 server = mailserver
 user = account
 password = password

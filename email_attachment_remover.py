@@ -1,36 +1,78 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
+#
+# This script will scan the mailbox or given folder (including sub-folders)
+# for e-mails with attachments larger than `max_attachment_size`.
+# Larger attachment will be extracted and stored in the given path `export`.
+# Afterwards the attachments are removed from the email and replaced with
+# a removal message.
+#
+# Todos:
+# * [ ] mark replaced massages as read (or the original message's state!)
+# * [ ] improve error handling
+# * [ ] splitup functions better
+# * [ ] export: check for file duplicates and handle dupes nicely
+# * [ ] handle flags properly (see https://stackoverflow.com/a/28748807)
+# * [x] add mail size limit (additionally to attachment limit)
+# * [x] configuration options: add default values
+# * [x] limit removal on older e-mail (e.g. older than 365d)
+# * [x] add folder,mail and attachment count
+#
+# This script is based on
+#   https://github.com/guido4000/Email-Attachment-Remover
+#
+# Further References:
+# * imaplib - IMAP4 client library: https://pymotw.com/2/imaplib/
+# * https://dev.to/shadow_b/download-email-attachments-using-python-3lji
+# * imap-delete-attachments: https://github.com/caltabid/imap-delete-attachments
+# * Print emails from a given date interval: https://gist.github.com/zed/9336086
+# * IMAP Search Criteria: https://gist.github.com/martinrusev/6121028
+# * imaplib — IMAP4 Client Library: https://pymotw.com/3/imaplib/
+#
 
 import imaplib
 import email
+from email.header import decode_header
+from email.policy import default
 import time
 import configparser
+import humanfriendly
+import os
+import datetime
+import logging
+import sys
 
+logging.basicConfig(stream=sys.stderr, format='%(message)s', level=logging.INFO)
+logging.debug('DEBUG ACTIVATED')
+
+# read configuration
 config = configparser.ConfigParser()
 config.sections()
-config.read('env/config.ini')
+config.read('config.ini')
 config.sections()
 
-# Global vars
-all_folders = config['DEFAULT']['all_folders']
-max_size = int(config['DEFAULT']['max_size'])
-standard_folder = config['DEFAULT']['standard_folder']
-test_mode = config['DEFAULT']['test_mode']
-server = config['mailserver']['server']
-user = config['mailserver']['user']
-password = config['mailserver']['password']
+# set global variables from configuration or use default values
+MODE = config['DEFAULT'].get('mode', 'test')
 
-def check_size(msg, size):
-    find = False
-    for part in msg.walk():
-        if part.get_content_maintype() == 'multipart':
-            continue
-        size_real = len(str(part)) / 4 * 3 / 1000
-        if (size_real > size):
-            find = True
-    return find
+EXPORT_FOLDER_NAME = config['EXPORT'].get('export_folder', 'export')
 
-ReplaceString = """
+SERVER = config['MAILSERVER'].get('server', '')
+USER = config['MAILSERVER'].get('user', '')
+PASSWORD = config['MAILSERVER'].get('password', '')
+
+MAIL_FOLDER = config['MAIL'].get('mail_folder', '')
+EMAIL_AGE_DAYS = int(config['MAIL'].get('email_age_days', '365'))
+MAX_ATTACHMENT_SIZE = config['MAIL'].get('max_attachment_size', '256')
+MAX_MAIL_SIZE = config['MAIL'].get('max_mail_size', '2048')
+IGNORE_FLAGGED = config['MAIL'].get('ignore_flagged', 'true')
+
+# check if the given export folder exists and create it if now
+if not os.path.exists(EXPORT_FOLDER_NAME):
+    os.makedirs(EXPORT_FOLDER_NAME, mode=0o777)
+EXPORT_FOLDER_PATH = os.path.abspath(EXPORT_FOLDER_NAME)
+
+# replacement string for removed attachments
+REPLACESTRING = """
 This message contained an attachment that was stripped out.
 The original type was: %(content_type)s
 The filename was: %(filename)s,
@@ -38,16 +80,62 @@ The filename was: %(filename)s,
 %(params)s)
 """
 
-def sanitise_size(msg, size):
-    ct = msg.get_content_type()
-    fn = msg.get_filename()
-    size_real = len(str(msg)) / 4 * 3 / 1000
-    print('file size: ', size_real)
-    if (size_real > size) & (msg.get_content_maintype() != 'multipart'):
-        print('hit!')
+count_attachments = 0
+count_folders = 0
+count_mail = 0
+
+
+def has_attachment_larger_than_size(msg, max_attachment_size):
+    # determine if the given message contains attachments larger than
+    # `max_attachment_size`
+    find = False
+    for attachment in msg.iter_attachments():
+        size_real = len(str(attachment)) / 4 * 3
+        if (size_real > max_attachment_size):
+            find = True
+    return find
+
+
+def expunge(msg, max_attachment_size, filename_prefix):
+    global count_attachments
+
+    size_real = len(str(msg)) / 4 * 3
+
+    if msg.get_content_maintype() != 'multipart':
+        if msg.is_attachment() is False:
+            return msg
+
+        # only remove attachments larger than max_attachment_size
+        if size_real < max_attachment_size:
+            return msg
+
+        try:
+            fn = msg.get_filename()
+            ct = msg.get_content_type()
+        except AttributeError:
+            logging.debug('expunge> got string instead of filename for %s. Skipping.', fn)
+            return msg
+
+        if fn:
+            output_filename = filename_prefix + " " + fn
+            filepath = os.path.join(EXPORT_FOLDER_PATH, output_filename)
+
+            if MODE in ['test']:
+                logging.debug('expunge> [TEST] would export "%s" to "%s" (%s)', fn, filepath, humanfriendly.format_size(size_real))
+            if MODE in ['export', 'detach']:
+                logging.debug('expunge> exporting "%s" to "%s" (%s)', fn, filepath, humanfriendly.format_size(size_real))
+                with open(filepath, 'wb') as f:
+                    # TODO: check for duplicates!
+                    f.write(msg.get_payload(decode=True))
+
+        #logging.debug('expunge> content type: %s', ct)
+        #logging.debug('expunge> %s (%s)', fn, humanfriendly.format_size(size_real))
+        #logging.debug('--')
+
+        # create new message with replaced attachment
         params = msg.get_params()[1:]
-        params = ', '.join([ '='.join(p) for p in params ])
-        replace = ReplaceString % dict(content_type=ct,
+        params = ', '.join(['='.join(p) for p in params])
+        replace = REPLACESTRING % dict(content_type=ct,
                                        filename=fn,
                                        params=params)
         msg.set_payload(replace)
@@ -56,65 +144,52 @@ def sanitise_size(msg, size):
         msg.set_type('text/plain')
         del msg['Content-Transfer-Encoding']
         del msg['Content-Disposition']
+        count_attachments += 1
     else:
         if msg.is_multipart():
-            payload = [ sanitise_size(x, size) for x in msg.get_payload() ]
+            # note: we have to use get_payload() to replace all parts of the e-mail.
+            # iter_attachments() is not sufficient here.
+            payload = [expunge(part, max_attachment_size, filename_prefix) for part in msg.get_payload()]
             msg.set_payload(payload)
+
     return msg
 
 
-# File handler 1: check for completed folders
-def read_and_search(file_name, folder_name):
-    found_folder = False
-    try:
-        f = open(file_name)
-        try:
-            for line in f:
-                if (line == folder_name + "\n"):
-                    found_folder = True
-        except:
-            print('issue')
-        finally:
-            f.close()
-    except (IOError, OSError) as e:
-        print('no file')
-    print('found_folder:', found_folder)
-    return found_folder
-
-# File handler 2: append completed folders
-def apppend_folder(file_name, entry):
-    print('append')
-    with open(file_name, 'a+') as f:
-        f.write(entry + "\n")
-
 # Main script
 def run_saver(mail):
-    a = 0; b = 0
-    mail.list()
-    res, list = mail.list()
-    if all_folders == 'False':
-        print('Scanning just one folder: ',standard_folder )
-        folders = [ standard_folder ]
+    global count_folders
+    global count_mail
+
+    # determine the date limit
+    max_date = datetime.date.today() - datetime.timedelta(days=EMAIL_AGE_DAYS)
+    max_date = max_date.strftime('%d-%b-%Y')
+    max_mail_size_in_bytes = humanfriendly.parse_size(MAX_MAIL_SIZE)
+    max_attachment_size_in_bytes = humanfriendly.parse_size(MAX_ATTACHMENT_SIZE)
+
+    if not MAIL_FOLDER:
+        logging.info('Scanning for messages before %s and larger than %s in all folders.', max_date, MAX_MAIL_SIZE)
+        res, folder_list = mail.list()
+        folders = [item.split()[-1].decode() for item in folder_list]
     else:
-        folders = [ item.split()[-1].decode() for item in list ]
+        logging.info('Scanning for messages before %s and larger than %s in %s.', max_date, MAX_MAIL_SIZE, MAIL_FOLDER)
+        folders = [MAIL_FOLDER]
+        res, folder_list = mail.list(directory=MAIL_FOLDER)
+        folders += [item.split()[-1].decode() for item in folder_list]
+
     for folder in folders:
-        if test_mode == 'True':
-            a += 1
-            if a == 2:
-                break
-        print('folder:', folder)
-        if read_and_search('folders.txt', folder):
-            continue
+        count_folders += 1
+        logging.debug('run_saver> folder: %s', folder)
         mail.select(folder)
-        result_mails, data_mails = mail.uid('search', None, "ALL")
+
+        # retreive all email messages matching our filter
+        #result_mails, data_mails = mail.uid('search', '((BEFORE "' + max_date + '") (LARGER "' + MAX_MAIL_SIZE + '"))')
+        #result_mails, data_mails = mail.uid('search', '(LARGER 6000000)')
+        result_mails, data_mails = mail.uid('search', '(BEFORE "' + max_date + '" LARGER ' + str(max_mail_size_in_bytes) + ' UNFLAGGED)')
 
         for email_uid in data_mails[0].split():
-            if test_mode == 'True':
-                b += 1
-                if b == 2:
-                    break
+            count_mail += 1
             mytime = imaplib.Time2Internaldate(time.time())
-            print('uid: ', email_uid)
+            logging.debug('run_saver> examining e-mail with `uid`: %s', email_uid)
             result, data = mail.uid('fetch', email_uid, '(RFC822)')
             try:
                 raw_email = (data[0][1]).decode('utf-8')
@@ -124,22 +199,46 @@ def run_saver(mail):
                 except:
                     raw_email = (data[0][1]).decode('utf-8', 'backslashreplace')
 
-            email_message = email.message_from_string(raw_email)
-            if check_size(email_message, max_size):
-                print('optimizing email')
-                new_mess = sanitise_size(email_message, max_size)
-                mail.append(folder, '', mytime, new_mess.as_string().encode())
-                mail.uid('STORE', email_uid  , '+FLAGS', '(\Deleted)')
+            email_message = email.message_from_string(raw_email, policy=email.policy.default)
+            #logging.debug('run_saver> email_message: %s', email_message)
+
+            if has_attachment_larger_than_size(email_message, max_attachment_size_in_bytes):
+                logging.debug('run_saver> optimizing email: %s', email_uid)
+
+                date = decode_header(email_message["Date"])[0][0]
+                date_object = datetime.datetime.strptime(date, "%a, %d %b %Y %H:%M:%S %z")
+                filename_prefix = eval(folder) + "/" + date_object.strftime("%Y%m%d-%H%M")
+                logging.debug('run_saver> email received: %s', filename_prefix)
+
+                output_folder = EXPORT_FOLDER_NAME + "/" + eval(folder)
+                if not os.path.exists(output_folder):
+                    os.makedirs(output_folder, mode=0o777)
+
+                new_message = expunge(email_message, max_attachment_size_in_bytes, filename_prefix)
+
+                # replace the original message with the expunged message
+                if MODE in ['delete', 'detach']:
+                    logging.debug('run_saver> removed attachment(s)')
+                    mail.append(folder, r'(\Seen)', mytime, new_message.as_string().encode())
+                    mail.uid('STORE', email_uid, '+FLAGS', r'(\Deleted)')
+            else:
+                logging.debug('run_saver> message to small')
+
         mail.expunge()
-        # apppend_folder('folders.txt', folder)
-        print('folder completed: ', folder)
+        logging.debug('run_saver> folder completed: %s', folder)
+
+    logging.info('')
+    logging.info('Summary:')
+    logging.info('* Scanned %d folders', count_folders)
+    logging.info('* Scanned %d e-mails', count_mail)
+    logging.info('* Extracted %d attachments', count_attachments)
 
 
 def main():
     try:
         while True:
-            mail = imaplib.IMAP4_SSL(server)
-            r, d = mail.login(user, password)
+            mail = imaplib.IMAP4_SSL(SERVER)
+            r, d = mail.login(USER, PASSWORD)
             assert r == 'OK', 'login failed'
             try:
                 run_saver(mail)
@@ -148,11 +247,12 @@ def main():
             mail.logout()
             break
     except KeyboardInterrupt:
-        print('\nCancelling...')
+        logging.info('\nCancelling...')
     except (SystemExit):
         e = get_exception()
         if getattr(e, 'code', 1) != 0:
             raise SystemExit('ERROR: %s' % e)
+
 
 if __name__ == '__main__':
     main()
