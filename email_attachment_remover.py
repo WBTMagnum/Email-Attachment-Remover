@@ -7,30 +7,6 @@
 # Afterwards the attachments are removed from the email and replaced with
 # a removal message.
 #
-# Todos:
-# * [ ] update README.md
-# * [ ] improve error handling
-# * [ ] splitup functions better
-# * [ ] export: check for file duplicates and handle dupes nicely
-# * [ ] ignore eml attachments
-# * [x] handle flags ("\Answered \Flagged \Draft \Deleted \Seen \Forwarded") properly (see https://stackoverflow.com/a/28748807)
-# * [x] add mail size limit (additionally to attachment limit)
-# * [x] configuration options: add default values
-# * [x] limit removal on older e-mail (e.g. older than 365d)
-# * [x] add folder, mail and attachment count
-#
-# This script is based on
-#   https://github.com/guido4000/Email-Attachment-Remover
-#
-# Further References:
-# * imaplib - IMAP4 client library: https://pymotw.com/2/imaplib/
-# * https://dev.to/shadow_b/download-email-attachments-using-python-3lji
-# * imap-delete-attachments: https://github.com/caltabid/imap-delete-attachments
-# * Print emails from a given date interval: https://gist.github.com/zed/9336086
-# * IMAP Search Criteria: https://gist.github.com/martinrusev/6121028
-# * imaplib — IMAP4 Client Library: https://pymotw.com/3/imaplib/
-# * pymap-copy - https://github.com/Schluggi/pymap-copy/tree/master
-#
 
 import imaplib
 import email
