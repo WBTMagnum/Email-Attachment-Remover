@@ -4,18 +4,15 @@
 - Adjust config.ini sample, rename to config.ini
 	- Set IMAP mailbox login configuration
 	- Decide to run single folder (recursive) or all folders
-	- Set operation mode ([test]|export|delete|detach)
-- Run email_attachment_remover.py
+	- Set operation mode (`[test]`|`export`|`delete`|`detach`)
+- Run `email_attachment_remover.py`
 
-
-# Hints
+## Hints
 
 * Run it on a fast Internet connection as it has to download all mails and attachments and partly upload it again
 
 
 # Ressources
-
-## Email Parsing
 
 ## Standards & Specs
 - [IMAP Protocol (RFC 2060)](https://tools.ietf.org/html/rfc2060.html)
