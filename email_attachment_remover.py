@@ -8,15 +8,16 @@
 # a removal message.
 #
 # Todos:
-# * [ ] mark replaced massages as read (or the original message's state!)
+# * [ ] update README.md
 # * [ ] improve error handling
 # * [ ] splitup functions better
 # * [ ] export: check for file duplicates and handle dupes nicely
-# * [ ] handle flags properly (see https://stackoverflow.com/a/28748807)
+# * [ ] ignore eml attachments
+# * [x] handle flags ("\Answered \Flagged \Draft \Deleted \Seen \Forwarded") properly (see https://stackoverflow.com/a/28748807)
 # * [x] add mail size limit (additionally to attachment limit)
 # * [x] configuration options: add default values
 # * [x] limit removal on older e-mail (e.g. older than 365d)
-# * [x] add folder,mail and attachment count
+# * [x] add folder, mail and attachment count
 #
 # This script is based on
 #   https://github.com/guido4000/Email-Attachment-Remover
@@ -28,6 +29,7 @@
 # * Print emails from a given date interval: https://gist.github.com/zed/9336086
 # * IMAP Search Criteria: https://gist.github.com/martinrusev/6121028
 # * imaplib — IMAP4 Client Library: https://pymotw.com/3/imaplib/
+# * pymap-copy - https://github.com/Schluggi/pymap-copy/tree/master
 #
 
 import imaplib
@@ -41,6 +43,7 @@ import os
 import datetime
 import logging
 import sys
+from imap_tools import MailBox, AND, A, U
 
 logging.basicConfig(stream=sys.stderr, format='%(message)s', level=logging.INFO)
 logging.debug('DEBUG ACTIVATED')
@@ -73,6 +76,9 @@ EXPORT_FOLDER_PATH = os.path.abspath(EXPORT_FOLDER_NAME)
 
 # replacement string for removed attachments
 REPLACESTRING = """
+The attachment %(filename)s has been detached.
+"""
+REPLACESTRING_LONG = """
 This message contained an attachment that was stripped out.
 The original type was: %(content_type)s
 The filename was: %(filename)s,
@@ -85,9 +91,55 @@ count_folders = 0
 count_mail = 0
 
 
+def retrieve_flags():
+    """
+    Use imap-tools[*] to retrieve the flags for the matching messages.
+    the flags will be returned in a dict of ((int)message-id, (str)flags)
+
+    [*] for reasons unknow, imaplib refuses to return the flags.
+
+    Args:
+
+    Returns:
+        Dict
+    """
+
+    with MailBox(SERVER).login(USER, PASSWORD) as mailbox:
+        flags_dict = {}
+
+        # determine the date and size limits
+        max_date = datetime.date.today() - datetime.timedelta(days=EMAIL_AGE_DAYS)
+        max_mail_size_in_bytes = humanfriendly.parse_size(MAX_MAIL_SIZE)
+        max_attachment_size_in_bytes = humanfriendly.parse_size(MAX_ATTACHMENT_SIZE)
+
+        # select given folder as current folder
+        mailbox.folder.set(MAIL_FOLDER.replace('"', ''))
+
+        # get selected folder
+        current_folder = mailbox.folder.get()
+
+        # get current and all subfolders of the specified folder (root by default)
+        for folder in mailbox.folder.list('', current_folder + '*'):
+            logging.debug('retrieve_flags> Scanning %s for message flags ...', folder.name)
+
+            # switch to folder and
+            # retrieve messages matching criteria (age, size, unflagged)
+            mailbox.folder.set(folder.name)
+            messages = mailbox.fetch(AND(date_lt=max_date, size_gt=max_mail_size_in_bytes, flagged=False), mark_seen=False)
+            for msg in messages:
+                logging.debug('retrieve_flags> Processing message uid %s from %s: %s FROM %s TO %s [%s] (%s)', msg.uid, msg.date, msg.subject, msg.from_, msg.to, msg.flags, humanfriendly.format_size(msg.size_rfc822))
+
+                msg_flags = ' '.join(msg.flags)
+                flags_dict[msg.uid] = msg_flags
+
+    return flags_dict
+
+
 def has_attachment_larger_than_size(msg, max_attachment_size):
-    # determine if the given message contains attachments larger than
-    # `max_attachment_size`
+    """
+    determine if the given message contains attachments larger than
+    `max_attachment_size`
+    """
     find = False
     for attachment in msg.iter_attachments():
         size_real = len(str(attachment)) / 4 * 3
@@ -97,6 +149,8 @@ def has_attachment_larger_than_size(msg, max_attachment_size):
 
 
 def expunge(msg, max_attachment_size, filename_prefix):
+    """
+    """
     global count_attachments
 
     size_real = len(str(msg)) / 4 * 3
@@ -116,6 +170,10 @@ def expunge(msg, max_attachment_size, filename_prefix):
             logging.debug('expunge> got string instead of filename for %s. Skipping.', fn)
             return msg
 
+        # skip embedded email messages
+        if ct == 'message/rfc822':
+            return msg
+
         if fn:
             output_filename = filename_prefix + " " + fn
             filepath = os.path.join(EXPORT_FOLDER_PATH, output_filename)
@@ -123,7 +181,7 @@ def expunge(msg, max_attachment_size, filename_prefix):
             if MODE in ['test']:
                 logging.debug('expunge> [TEST] would export "%s" to "%s" (%s)', fn, filepath, humanfriendly.format_size(size_real))
             if MODE in ['export', 'detach']:
-                logging.debug('expunge> exporting "%s" to "%s" (%s)', fn, filepath, humanfriendly.format_size(size_real))
+                logging.debug('expunge> exporting "%s" (%s) to "%s" (%s)', fn, ct, filepath, humanfriendly.format_size(size_real))
                 with open(filepath, 'wb') as f:
                     # TODO: check for duplicates!
                     f.write(msg.get_payload(decode=True))
@@ -157,6 +215,8 @@ def expunge(msg, max_attachment_size, filename_prefix):
 
 # Main script
 def run_saver(mail):
+    """
+    """
     global count_folders
     global count_mail
 
@@ -165,6 +225,12 @@ def run_saver(mail):
     max_date = max_date.strftime('%d-%b-%Y')
     max_mail_size_in_bytes = humanfriendly.parse_size(MAX_MAIL_SIZE)
     max_attachment_size_in_bytes = humanfriendly.parse_size(MAX_ATTACHMENT_SIZE)
+
+    # retrieve flags for all messages matching our criteria (size, age, seen)
+    flags_per_message = retrieve_flags()
+    #print("FLAGS: ", flags_per_message)
+    #print("Test: ", flags_per_message['648340'].decode("unicode_escape"))
+    #sys.exit()
 
     if not MAIL_FOLDER:
         logging.info('Scanning for messages before %s and larger than %s in all folders.', max_date, MAX_MAIL_SIZE)
@@ -186,11 +252,15 @@ def run_saver(mail):
         #result_mails, data_mails = mail.uid('search', '(LARGER 6000000)')
         result_mails, data_mails = mail.uid('search', '(BEFORE "' + max_date + '" LARGER ' + str(max_mail_size_in_bytes) + ' UNFLAGGED)')
 
+        msg_nums = data_mails[0].split()
+        logging.info('Found %s messages in folder %s.', len(msg_nums), folder)
+
         for email_uid in data_mails[0].split():
             count_mail += 1
             mytime = imaplib.Time2Internaldate(time.time())
             logging.debug('run_saver> examining e-mail with `uid`: %s', email_uid)
-            result, data = mail.uid('fetch', email_uid, '(RFC822)')
+            response, data = mail.uid('fetch', email_uid, '(RFC822)')
+
             try:
                 raw_email = (data[0][1]).decode('utf-8')
             except:
@@ -198,6 +268,11 @@ def run_saver(mail):
                     raw_email = (data[0][1]).decode('iso-8859-1')
                 except:
                     raw_email = (data[0][1]).decode('utf-8', 'backslashreplace')
+
+            # retrieve flags (not working)
+            #flags = imaplib.ParseFlags(data[0][0])
+            #flag_str = " ".join(flags)
+            #logging.info('run_saver> Flags for %s: %s', email_uid, flag_str)
 
             email_message = email.message_from_string(raw_email, policy=email.policy.default)
             #logging.debug('run_saver> email_message: %s', email_message)
@@ -219,7 +294,12 @@ def run_saver(mail):
                 # replace the original message with the expunged message
                 if MODE in ['delete', 'detach']:
                     logging.debug('run_saver> removed attachment(s)')
-                    mail.append(folder, r'(\Seen)', mytime, new_message.as_string().encode())
+
+                    # use flags retrieved via imap-tools
+                    msg_flags = flags_per_message[email_uid.decode('UTF-8')]
+                    logging.debug('run_saver> flags this message with: %s', msg_flags)
+
+                    mail.append(folder, msg_flags, mytime, new_message.as_string().encode())
                     mail.uid('STORE', email_uid, '+FLAGS', r'(\Deleted)')
             else:
                 logging.debug('run_saver> message to small')
@@ -235,16 +315,21 @@ def run_saver(mail):
 
 
 def main():
+    """
+    """
     try:
         while True:
-            mail = imaplib.IMAP4_SSL(SERVER)
-            r, d = mail.login(USER, PASSWORD)
+            # open connection using imaplib
+            imaplib_connection = imaplib.IMAP4_SSL(SERVER)
+            r, d = imaplib_connection.login(USER, PASSWORD)
             assert r == 'OK', 'login failed'
+
+            # open connection with imap-tools
             try:
-                run_saver(mail)
-            except mail.abort as e:
+                run_saver(imaplib_connection)
+            except imaplib_connection.abort as e:
                 continue
-            mail.logout()
+            imaplib_connection.logout()
             break
     except KeyboardInterrupt:
         logging.info('\nCancelling...')
